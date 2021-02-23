@@ -7,12 +7,14 @@ from itertools import islice
 
 import feedparser  # Parses RSS feeds
 import listparser  # Parses OPML files
-import requests  # To make downloads easier
-from tenacity import retry, stop_after_attempt
-from tinydb import Query, TinyDB
+import requests
+from six import reraise  # To make downloads easier
+from tinydb import Query
+from tinydb import TinyDB
 from tinydb.storages import JSONStorage
 from tinydb_serialization import SerializationMiddleware
 from tinydb_serialization.serializers import DateTimeSerializer
+from tenacity import retry, stop_after_attempt, RetryError
 from tqdm import tqdm
 
 
@@ -33,7 +35,12 @@ def parse_feed(url: str):
 def download_file(url, dest: pathlib.Path = None):
     # Disable SSL warnings
     requests.packages.urllib3.disable_warnings()
-    response = requests.get(url, stream=True, verify=False)
+    try:
+        response = requests.get(url, stream=True, verify=False, timeout=5)
+    except requests.exceptions.ReadTimeout as e:
+        print(
+            f"Getting timeout when trying to hit {url}. Error: {e}"
+        )  # TODO: Convert these types of print statements to loggers
     total_size_in_bytes = int(response.headers.get("content-length", 0))
     block_size = 8092
     title = dest.stem
@@ -66,17 +73,19 @@ def download_episode(entry, dir: pathlib.Path):
     for link in entry["links"]:
         if link["type"] in ["audio/mpeg"]:
             print(f'Downloading {entry["title"]}')
-            download_file(link["href"], download_path)
+            try:
+                download_file(link["href"], download_path)
+            except RetryError:
+                print(f'Unable to download {link["title"]} after 3 tries')
 
 
-def download_feed(feed, limit: int = 3):
+def download_feed(feed, out_dir: pathlib.Path, limit: int = 3):
     """
     Initiates downloads of a single feed (a show in Podcast parlance).
     This function merely coordinates calls to sub-functions which handle the actual downloading.
     """
-    cwd = pathlib.Path.cwd()
     # feed_dir = cwd / ''.join(x if x.isalnum() else "_" for x in feed["title"])
-    feed_dir = cwd / feed["title"].replace("/", "_")
+    feed_dir = out_dir / feed["title"].replace("/", "_")
     if not feed_dir.exists():
         feed_dir.mkdir(parents=True)
     for entry in islice(feed["entries"], 0, limit):
@@ -111,25 +120,25 @@ def parse_opml(file):
     return opml_feeds
 
 
+def import_opml(feeds, file):
+    opml_feeds = parse_opml("podcasts_opml.xml")
+    for feed in opml_feeds:
+        feeds.upsert(feed, Query()["title"] == feed["title"])
+
+
 def main(args):
     serialization = SerializationMiddleware(JSONStorage)
     serialization.register_serializer(DateTimeSerializer(), "TinyDate")
-    db = TinyDB("feeds.json", sort_keys=True, indent=4, separators=(",", ": "), storage=serialization)
+    db_path = args.output_dir / "feeds.json"
+    db = TinyDB(db_path, sort_keys=True, indent=4, separators=(",", ": "), storage=serialization)
     feeds = db.table("feeds")
-    if args.import_opml:
-        opml_feeds = parse_opml("podcasts_opml.xml")
-        for feed in opml_feeds:
-            feeds.upsert(feed, Query()["title"] == feed["title"])
 
-    # if meta_table.contains(doc_id=1):
-    #     last_updated = meta_table.get(doc_id=0)["last_updated"]
-    # else:
-    #     meta_table.insert(Document({"last_updated": now}, doc_id=1))
-    #     last_updated = now
-    # if (now - last_updated).days > 1:
+    if args.import_opml:
+        import_opml(feeds, args.import_opml)
+
     update_feeds(feeds, force_updates=args.force_updates)
     for feed in feeds.all():
-        download_feed(feed, args.max_episodes)
+        download_feed(feed, args.output_dir, args.max_episodes)
 
 
 if __name__ == "__main__":
@@ -147,7 +156,7 @@ if __name__ == "__main__":
         action="store_true",
         help='Force updates to feeds, even if they"re not stale',
     )
-    parser.add_argument("-m", "--max-episodes", type=int, help="Max number of episodes to keep for a show")
+    parser.add_argument("-m", "--max-episodes", type=int, default=3, help="Max number of episodes to keep for a show")
     parser.add_argument(
         "-o",
         "--output-dir",
